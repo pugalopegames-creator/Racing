@@ -1,0 +1,16 @@
+{
+  "name": "mouse-racer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multiplayer top-down browser racing game steered with the mouse",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
