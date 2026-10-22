@@ -1,0 +1,14 @@
+# Render blueprint: New → Blueprint → pick this repository, and Render sets the
+# service up from this file (Node runtime, build and start commands, EU region).
+# If package.json is not at the top of your repository (e.g. it's inside a
+# mouse-racer/ folder), uncomment rootDir and set it to that folder.
+services:
+  - type: web
+    name: mouse-racer
+    runtime: node
+    region: frankfurt
+    plan: free
+    # rootDir: mouse-racer
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
