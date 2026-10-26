@@ -206,6 +206,30 @@ same live board and results table (the server sends the clock and the table 4×/
 Online, R calls the marshal instead of restarting (you keep your place). A player
 who joins mid-session starts from the grid.
 
+## Player accounts (Supabase)
+
+Settings → Account: **Sign in with Google**, or **Play as guest** (an account made on
+the spot, kept on this device; "Add Google" later keeps its name and results). Signed
+in, your name is the same on every device, and every online practice, qualifying or
+race you finish is saved. **Leaderboard**: most wins, and fastest laps (only laps at
+the standard settings, so times compare). **Delete account** (two clicks) removes the
+account with its name and results. Offline races against bots aren't saved.
+
+How it fits together:
+- `public/account.js`: sign-in in the browser (Supabase Auth's web API, no library).
+  Google sign-in runs in a popup with the PKCE flow and comes back through
+  `public/auth-callback.html` on the game server.
+- `server/accounts.js`: the server checks each player's sign-in with Supabase, keeps
+  their profile name, saves results, and serves `/api/leaderboard` and
+  `/api/account/delete`. Only the server touches the database (secret key).
+- `supabase/schema.sql`: the tables (`profiles`, `results`) and the `leaderboard` view.
+- `public/account-config.js`: the project URL and publishable key (public by design).
+
+Server settings (Render → Environment): `SUPABASE_URL`, `SUPABASE_ANON_KEY` (the
+publishable key) and `SUPABASE_SERVICE_ROLE_KEY` (the secret key: never in the code).
+Without them the server runs as before, without accounts; its log says
+"(accounts on)" or "(accounts off)".
+
 ## Racing line and autopilot (`track.js`, `world.js`)
 
 - The racing line hits the apex of every bend: the tightest point of each bend

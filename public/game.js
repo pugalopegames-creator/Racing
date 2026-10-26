@@ -5,6 +5,7 @@ import { TRACK, ROAD_HALF, WALL, pointAt, queryTrack } from './shared/track.js';
 import { simulateCar, collideCars, gridSlot, playerSlot, newRace, updateRace, makeBot, botInput, decideLanes, applyTuning, setBotTuning, BOTS } from './shared/world.js';
 import { LINE } from './shared/track.js';
 import { createSound } from './sound.js';
+import { account } from './account.js';
 import { MODES, HOLD, newSess, createSession, beginSession, sessionClock, sessionLap, sessionTable } from './shared/session.js';
 
 // Asset URL: the single-file build inlines images into window.MR_ASSETS.
@@ -21,6 +22,8 @@ const FONT_D = '"Saira Condensed", "Arial Narrow", sans-serif';
 const FONT_B = '"IBM Plex Sans", system-ui, sans-serif';
 
 const params = new URLSearchParams(location.search);
+// served by the game server (rather than the single-file build or a local file)?
+const servedByGame = !window.MR_OFFLINE && /^https?:$/.test(location.protocol);
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 let W = 0, H = 0, DPR = 1;
@@ -72,8 +75,15 @@ addEventListener('keyup', (e) => { const k = KEYMAP[e.code]; if (k) keys[k] = fa
 const gpad = { gas: 0, brake: 0, handbrake: false, id: null, held: {} };
 const PAD_DEAD = 0.06;
 const trig = (v) => (v < PAD_DEAD ? 0 : Math.min(1, (v - PAD_DEAD) / (0.95 - PAD_DEAD)));
+// Some pages block controllers (e.g. inside a frame without the "gamepad" permission):
+// then asking throws, so after the first refusal we stop asking and the game simply
+// runs without a controller instead of crashing.
+let padBlocked = false;
 function activePad() {
-  const list = navigator.getGamepads ? [...navigator.getGamepads()].filter((g) => g && g.connected) : [];
+  if (padBlocked || !navigator.getGamepads) return null;
+  let list;
+  try { list = [...navigator.getGamepads()].filter((g) => g && g.connected); }
+  catch { padBlocked = true; return null; }
   return list.find((g) => g.mapping === 'standard') || list[0] || null;
 }
 addEventListener('gamepadconnected', (e) => {
@@ -174,6 +184,7 @@ function showSettings() {
   $('accel').value = Math.round(TUNE.engine * 100); $('accel-out').textContent = pct(TUNE.engine);
   $('botspeed').value = Math.round(BOTS.skill * 100); $('botspeed-out').textContent = pct(BOTS.skill);
   if (document.activeElement !== $('name-input')) $('name-input').value = myName;
+  showAccount();
   const where = (net.url || '').replace(/^wss?:\/\//, '');
   $('join-btn').textContent = net.mode === 'offline' ? 'JOIN' : 'LEAVE';
   $('join-note').textContent = net.mode === 'online' ? `Racing on ${where}`
@@ -245,6 +256,90 @@ $('botspeed').addEventListener('input', () => applyBots({ skill: Number($('botsp
 $('name-input').addEventListener('input', () => setMyName($('name-input').value));
 $('name-input').addEventListener('change', () => { setMyName($('name-input').value); $('name-input').value = myName; });
 $('name-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('name-input').blur(); });
+
+// ---- account (Settings → Account) and the leaderboard
+// The game server's web address (for Google sign-in's return page, the leaderboard and
+// deleting an account): the page's own server, or the server you've joined / saved.
+function serverHttp() {
+  if (servedByGame) return location.origin;
+  const w = net.url || chosenServer();
+  return w ? w.replace(/^ws/, 'http').replace(/\/+$/, '') : null;
+}
+let deleteArmed = 0;
+function showAccount() {
+  const row = $('row-account');
+  row.hidden = !account.configured;
+  if (!account.configured) return;
+  const u = account.user, srv = serverHttp();
+  $('acct-out').hidden = !!u; $('acct-in').hidden = !u;
+  $('acct-google').disabled = !srv;
+  $('acct-link').hidden = !(u && u.guest); $('acct-link').disabled = !srv;
+  $('acct-board').hidden = !srv;
+  if (u) {
+    $('acct-name').textContent = myName;
+    $('acct-kind').textContent = u.guest ? 'Guest · this device' : (u.email || 'Google');
+  }
+  $('acct-delete').textContent = deleteArmed > performance.now() ? 'Click again to delete for good' : 'Delete account';
+  $('acct-note').textContent = !srv ? 'Google sign-in and the leaderboard need your server: join it first'
+    : u ? (u.guest ? 'Add Google to keep this account on other devices' : 'Your name and online results are saved')
+      : 'Saves your name and online results';
+}
+async function sendAuth() {
+  if (net.mode !== 'online') return;
+  send({ t: 'auth', token: account.configured ? await account.token() : null });
+}
+account.onChange(() => { showAccount(); });
+$('acct-guest').addEventListener('click', async () => {
+  $('acct-guest').blur();
+  try { await account.signInGuest(); toast('Playing as a guest', '#7dd3fc'); sendAuth(); }
+  catch (e) { toast(`Guest sign-in failed: ${e.message}`, '#ffc83d'); }
+});
+async function google(link) {
+  const srv = serverHttp(); if (!srv) return;
+  try {
+    const u = await account.signInGoogle(`${srv}/auth-callback.html`);
+    // a fresh account still called "Driver 123": use your first name from Google
+    if (u && u.googleName && /^Driver \d+$/.test(myName)) setMyName(u.googleName.split(' ')[0]);
+    toast(link ? 'Google added to your account' : `Signed in${u && u.email ? ' as ' + u.email : ''}`, '#7dd3fc');
+    sendAuth();
+  } catch (e) { if (!/closed/i.test(e.message)) toast(`Google sign-in failed: ${e.message}`, '#ffc83d'); }
+}
+$('acct-google').addEventListener('click', () => { $('acct-google').blur(); google(false); });
+$('acct-link').addEventListener('click', () => { $('acct-link').blur(); google(true); });
+$('acct-signout').addEventListener('click', async () => { $('acct-signout').blur(); await account.signOut(); sendAuth(); toast('Signed out', '#a9b2a0'); });
+$('acct-delete').addEventListener('click', async () => {
+  // two clicks, so it can't happen by accident
+  if (deleteArmed < performance.now()) { deleteArmed = performance.now() + 4000; showAccount(); setTimeout(showAccount, 4100); return; }
+  deleteArmed = 0;
+  const srv = serverHttp(), token = await account.token();
+  if (!srv || !token) { toast('Join your server to delete your account', '#ffc83d'); return; }
+  try {
+    const r = await fetch(`${srv}/api/account/delete`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+    await account.signOut(); sendAuth();
+    toast('Account deleted', '#a9b2a0');
+  } catch (e) { toast(`Couldn't delete the account: ${e.message}`, '#ffc83d'); }
+});
+// leaderboard
+$('acct-board').addEventListener('click', async () => {
+  $('acct-board').blur();
+  const srv = serverHttp(); if (!srv) return;
+  $('board').hidden = false; $('board-sub').textContent = 'Loading…';
+  $('board-wins').innerHTML = ''; $('board-laps').innerHTML = '';
+  try {
+    const r = await fetch(`${srv}/api/leaderboard`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.status);
+    const esc = (t) => String(t).replace(/[<>&"]/g, '');
+    const table = (rows, right) => rows.length
+      ? `<tbody>${rows.map((x, i) => `<tr class="${x.name === myName ? 'me' : ''}"><td class="pos">${i + 1}</td><td>${esc(x.name)}</td><td class="num">${right(x)}</td></tr>`).join('')}</tbody>`
+      : '<tbody><tr><td>No results yet</td></tr></tbody>';
+    $('board-wins').innerHTML = table(d.wins || [], (x) => `${x.wins} win${x.wins === 1 ? '' : 's'} · ${x.races} race${x.races === 1 ? '' : 's'}`);
+    $('board-laps').innerHTML = table(d.laps || [], (x) => fmt(x.best_lap_ms / 1000));
+    $('board-sub').textContent = 'Online sessions of signed-in players · lap times at standard settings';
+  } catch (e) { $('board-sub').textContent = `Leaderboard unavailable (${e.message})`; }
+});
+$('board-close').addEventListener('click', () => { $('board').hidden = true; });
 
 function joinFromField() {
   if (net.mode !== 'offline') { leaveServer(); return; }
@@ -371,7 +466,6 @@ function wsUrl(addr) {
   if (/^http:\/\//i.test(addr)) return 'ws://' + addr.slice(7).replace(/\/+$/, '');
   return 'ws://' + addr.replace(/\/+$/, '');
 }
-const servedByGame = !window.MR_OFFLINE && /^https?:$/.test(location.protocol);
 function chosenServer() {
   if (params.has('offline')) return null;
   const p = params.get('server') || store.get('mr-server');
@@ -394,7 +488,11 @@ function connect(url = chosenServer(), explicit = false) {
   try { ws = new WebSocket(url); } catch { return fail(); }
   net.ws = ws;
   connectTimer = setTimeout(() => { if (net.ws === ws && net.mode === 'connecting') { ws.onclose = null; try { ws.close(); } catch {} explicit || store.get('mr-server') ? fail() : startOffline(); } }, 4000);
-  ws.onopen = () => { clearTimeout(connectTimer); ws.send(JSON.stringify({ t: 'hello', name: myName, car: myKind })); };
+  ws.onopen = async () => {
+    clearTimeout(connectTimer);
+    const token = account.configured ? await account.token() : null;
+    if (ws.readyState === 1) ws.send(JSON.stringify({ t: 'hello', name: myName, car: myKind, token }));
+  };
   ws.onmessage = (e) => { if (net.ws !== ws) return; try { onMessage(JSON.parse(e.data)); } catch (err) { console.error(err); } };
   ws.onclose = () => {
     if (net.ws !== ws) return;
@@ -570,6 +668,12 @@ function onMessage(m) {
     if (m.speed) setSpeed(m.speed);          // the room's pace and car tuning win
     if (m.tune) applyTuning(m.tune);
     showSettings();
+  } else if (m.t === 'account') {
+    if (m.ok) {
+      // the account's saved name wins (the same name on every device)
+      if (m.name && m.name !== myName) { myName = m.name; me.name = m.name; try { localStorage.setItem('mr-name', m.name); } catch {} }
+      showSettings();
+    } else toast(m.error || 'Sign-in failed', '#ffc83d');
   } else if (m.t === 'session') {
     applySession(m);
   } else if (m.t === 's') {

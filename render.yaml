@@ -1,14 +1,21 @@
 # Render blueprint: New → Blueprint → pick this repository, and Render sets the
-# service up from this file (Node runtime, build and start commands, EU region).
+# service up from this file (Node runtime, build and start commands, US East region).
 # If package.json is not at the top of your repository (e.g. it's inside a
 # mouse-racer/ folder), uncomment rootDir and set it to that folder.
 services:
   - type: web
     name: mouse-racer
     runtime: node
-    region: frankfurt
+    region: virginia            # US East: next to a Supabase project in US East (N. Virginia)
     plan: free
     # rootDir: mouse-racer
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /
+    envVars:                    # filled in on Render's dashboard (never put them in the code)
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false

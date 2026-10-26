@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { TICK_RATE, SPEED, setSpeed } from '../public/shared/physics.js';
 import { simulateCar, collideCars, gridSlot, playerSlot, newRace, updateRace, decideLanes, applyTuning, marshalCar, MAX_PLAYERS } from '../public/shared/world.js';
+import { accountsEnabled, verifyUser, getProfile, createProfile, renameProfile, saveResult, deleteUser, leaderboard, invalidateLeaderboard } from './accounts.js';
 import { MODES, HOLD, newSess, createSession, beginSession, sessionClock, sessionLap, sessionTable } from '../public/shared/session.js';
 import { TUNE } from '../public/shared/physics.js';
 
@@ -20,9 +21,36 @@ const IDLE_TICKS = 30;           // no input for 0.5s → park the car
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../public');
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml' };
 
+// Small web API for accounts (the game file may be opened from anywhere, so CORS is open;
+// nothing here is readable without a valid sign-in except the public leaderboard).
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
+const json = (res, code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS }); res.end(JSON.stringify(obj)); };
+async function api(req, res, p) {
+  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
+  if (p === '/api/config') return json(res, 200, { accounts: accountsEnabled });
+  if (!accountsEnabled) return json(res, 503, { error: 'Accounts are not set up on this server' });
+  if (p === '/api/leaderboard' && req.method === 'GET') {
+    try { return json(res, 200, await leaderboard()); } catch (e) { console.warn('leaderboard:', e.message); return json(res, 502, { error: 'Leaderboard unavailable' }); }
+  }
+  if (p === '/api/account/delete' && req.method === 'POST') {
+    // delete your own account (and with it your profile and results): needs your sign-in
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    try {
+      const user = await verifyUser(token);
+      await deleteUser(user.id);
+      for (const pl of players.values()) if (pl.user && pl.user.id === user.id) pl.user = null;
+      invalidateLeaderboard();
+      console.log(`  account deleted (${user.guest ? 'guest' : 'google'})`);
+      return json(res, 200, { ok: true });
+    } catch (e) { return json(res, e.status === 401 || e.status === 403 ? 401 : 502, { error: e.message }); }
+  }
+  return json(res, 404, { error: 'Not found' });
+}
+
 const server = http.createServer((req, res) => {
   let p;
   try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
+  if (p.startsWith('/api/')) { api(req, res, p).catch((e) => json(res, 500, { error: e.message })); return; }
   if (p === '/') p = '/index.html';
   const file = path.join(ROOT, p);
   if (!file.startsWith(ROOT + path.sep)) { res.writeHead(403).end(); return; }
@@ -72,6 +100,36 @@ function startRoomSession(mode, fromQuali, by) {
   console.log(`  ${by} started ${MODES[S.mode].label}`);
 }
 
+// ---- accounts: check the sign-in, use the account's saved name (or save this one)
+async function signIn(p, token) {
+  if (!accountsEnabled) { send(p.ws, { t: 'account', ok: false, error: 'Accounts are not set up on this server' }); return; }
+  try {
+    const user = await verifyUser(token);
+    p.user = user;
+    const prof = await getProfile(user.id);
+    if (prof && prof.name) p.name = prof.name;
+    else await createProfile(user.id, p.name);
+    send(p.ws, { t: 'account', ok: true, name: p.name, guest: user.guest });
+    console.log(`  ${p.name} signed in (${user.guest ? 'guest' : 'google'})`);
+  } catch (e) {
+    p.user = null;
+    send(p.ws, { t: 'account', ok: false, error: e.status === 401 || e.status === 403 ? 'Your sign-in has expired: please sign in again' : 'Could not reach the account service' });
+    console.warn('sign-in:', e.message);
+  }
+}
+// a signed-in player finished an online session: save it
+function recordResult(p) {
+  if (!p.user || S.mode === 'free') return;
+  const row = sessionTable(S, entries()).find((r) => r.id === p.id);
+  if (!row) return;
+  const ms = (t) => (t > 0 ? Math.round(t * 1000 / 60) : null);
+  saveResult({
+    user_id: p.user.id, mode: S.mode, position: row.pos, field_size: players.size,
+    best_lap_ms: ms(row.tbest), race_time_ms: S.mode === 'race' ? ms(row.time) : null, laps: row.laps,
+    pace: SPEED, grip: TUNE.grip, engine: TUNE.engine,
+  }).then(invalidateLeaderboard).catch((e) => console.warn('save result:', e.message));
+}
+
 function freeSlot() {
   const used = new Set([...players.values()].map((p) => p.slot));
   for (let i = 0; i < MAX_PLAYERS; i++) if (!used.has(i)) return i;
@@ -109,10 +167,17 @@ wss.on('connection', (ws) => {
       const name = cleanName(m.name);
       if (name) p.name = name;
       if (m.car === 'gt' || m.car === 'proto') p.kind = m.car;
+      if (m.token) signIn(p, String(m.token));
+    } else if (m.t === 'auth') {
+      // signed in or out while connected
+      if (m.token) signIn(p, String(m.token)); else p.user = null;
     } else if (m.t === 'name') {
       // renamed in Settings while connected; everyone sees it in the next snapshot
       const name = cleanName(m.name);
-      if (name) p.name = name;
+      if (name) {
+        p.name = name;
+        if (p.user) renameProfile(p.user.id, name).catch((e) => console.warn('rename:', e.message));
+      }
     } else if (m.t === 'car') {
       if (m.car === 'gt' || m.car === 'proto') p.kind = m.car;
     } else if (m.t === 'speed') {
@@ -163,7 +228,7 @@ function step() {
       const ev = updateRace(p.race, q.s, tick);
       if (ev) {
         broadcast({ t: 'lap', id: p.id, time: ev.time, best: ev.best, laps: p.race.laps });
-        if (sessionLap(S, p, ev, tick)) finished = true;
+        if (sessionLap(S, p, ev, tick)) { finished = true; recordResult(p); }
       }
     }
   }
@@ -200,4 +265,4 @@ setInterval(() => {
   if (n === 5) acc = 0;
 }, STEP_MS / 2);
 
-server.listen(PORT, () => console.log(`Mouse Racer on http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Mouse Racer on http://localhost:${PORT}${accountsEnabled ? ' (accounts on)' : ' (accounts off: set SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY)'}`));
